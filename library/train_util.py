@@ -70,6 +70,7 @@ from library.lpw_stable_diffusion import StableDiffusionLongPromptWeightingPipel
 import library.model_util as model_util
 import library.huggingface_util as huggingface_util
 import library.sai_model_spec as sai_model_spec
+import library.deepspeed_utils as deepspeed_utils
 from library.utils import setup_logging
 
 setup_logging()
@@ -410,6 +411,7 @@ class DreamBoothSubset(BaseSubset):
         is_reg: bool,
         class_tokens: Optional[str],
         caption_extension: str,
+        cache_info: bool,
         num_repeats,
         shuffle_caption,
         caption_separator: str,
@@ -458,6 +460,7 @@ class DreamBoothSubset(BaseSubset):
         self.caption_extension = caption_extension
         if self.caption_extension and not self.caption_extension.startswith("."):
             self.caption_extension = "." + self.caption_extension
+        self.cache_info = cache_info
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, DreamBoothSubset):
@@ -527,6 +530,7 @@ class ControlNetSubset(BaseSubset):
         image_dir: str,
         conditioning_data_dir: str,
         caption_extension: str,
+        cache_info: bool,
         num_repeats,
         shuffle_caption,
         caption_separator,
@@ -574,6 +578,7 @@ class ControlNetSubset(BaseSubset):
         self.caption_extension = caption_extension
         if self.caption_extension and not self.caption_extension.startswith("."):
             self.caption_extension = "." + self.caption_extension
+        self.cache_info = cache_info
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, ControlNetSubset):
@@ -1410,6 +1415,8 @@ class BaseDataset(torch.utils.data.Dataset):
 
 
 class DreamBoothDataset(BaseDataset):
+    IMAGE_INFO_CACHE_FILE = "metadata_cache.json"
+
     def __init__(
         self,
         subsets: Sequence[DreamBoothSubset],
@@ -1869,11 +1876,15 @@ class ControlNetDataset(BaseDataset):
 
         db_subsets = []
         for subset in subsets:
+            assert (
+                not subset.random_crop
+            ), "random_crop is not supported in ControlNetDataset / random_cropはControlNetDatasetではサポートされていません"
             db_subset = DreamBoothSubset(
                 subset.image_dir,
                 False,
                 None,
                 subset.caption_extension,
+                subset.cache_info,
                 subset.num_repeats,
                 subset.shuffle_caption,
                 subset.caption_separator,
@@ -1919,7 +1930,7 @@ class ControlNetDataset(BaseDataset):
 
         # assert all conditioning data exists
         missing_imgs = []
-        cond_imgs_with_img = set()
+        cond_imgs_with_pair = set()
         for image_key, info in self.dreambooth_dataset_delegate.image_data.items():
             db_subset = self.dreambooth_dataset_delegate.image_to_subset[image_key]
             subset = None
@@ -1933,23 +1944,29 @@ class ControlNetDataset(BaseDataset):
                 logger.warning(f"not directory: {subset.conditioning_data_dir}")
                 continue
 
-            img_basename = os.path.basename(info.absolute_path)
-            ctrl_img_path = os.path.join(subset.conditioning_data_dir, img_basename)
-            if not os.path.exists(ctrl_img_path):
+            img_basename = os.path.splitext(os.path.basename(info.absolute_path))[0]
+            ctrl_img_path = glob_images(subset.conditioning_data_dir, img_basename)
+            if len(ctrl_img_path) < 1:
                 missing_imgs.append(img_basename)
+                continue
+            ctrl_img_path = ctrl_img_path[0]
+            ctrl_img_path = os.path.abspath(ctrl_img_path)  # normalize path
 
             info.cond_img_path = ctrl_img_path
-            cond_imgs_with_img.add(ctrl_img_path)
+            cond_imgs_with_pair.add(os.path.splitext(ctrl_img_path)[0])  # remove extension because Windows is case insensitive
 
         extra_imgs = []
         for subset in subsets:
             conditioning_img_paths = glob_images(subset.conditioning_data_dir, "*")
-            extra_imgs.extend(
-                [cond_img_path for cond_img_path in conditioning_img_paths if cond_img_path not in cond_imgs_with_img]
-            )
+            conditioning_img_paths = [os.path.abspath(p) for p in conditioning_img_paths]  # normalize path
+            extra_imgs.extend([p for p in conditioning_img_paths if os.path.splitext(p)[0] not in cond_imgs_with_pair])
 
-        assert len(missing_imgs) == 0, f"missing conditioning data for {len(missing_imgs)} images: {missing_imgs}"
-        assert len(extra_imgs) == 0, f"extra conditioning data for {len(extra_imgs)} images: {extra_imgs}"
+        assert (
+            len(missing_imgs) == 0
+        ), f"missing conditioning data for {len(missing_imgs)} images / 制御用画像が見つかりませんでした: {missing_imgs}"
+        assert (
+            len(extra_imgs) == 0
+        ), f"extra conditioning data for {len(extra_imgs)} images / 余分な制御用画像があります: {extra_imgs}"
 
         self.conditioning_image_transforms = IMAGE_TRANSFORMS
 
@@ -3083,6 +3100,7 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--full_bf16", action="store_true", help="bf16 training including gradients / 勾配も含めてbf16で学習する"
     )  # TODO move to SDXL training, because it is not supported by SD1/2
     parser.add_argument("--fp8_base", action="store_true", help="use fp8 for base model / base modelにfp8を使う")
+
     parser.add_argument(
         "--ddp_timeout",
         type=int,
@@ -3145,6 +3163,7 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         default=None,
         help="specify WandB API key to log in before starting training (optional). / WandB APIキーを指定して学習開始前にログインする（オプション）",
     )
+
     parser.add_argument(
         "--noise_offset",
         type=float,
@@ -3209,6 +3228,27 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         type=int,
         default=None,
         help="set maximum time step for U-Net training (1~1000, default is 1000) / U-Net学習時のtime stepの最大値を設定する（1~1000で指定、省略時はデフォルト値(1000)）",
+    )
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="l2",
+        choices=["l2", "huber", "smooth_l1"],
+        help="The type of loss function to use (L2, Huber, or smooth L1), default is L2 / 使用する損失関数の種類（L2、Huber、またはsmooth L1）、デフォルトはL2",
+    )
+    parser.add_argument(
+        "--huber_schedule",
+        type=str,
+        default="exponential",
+        choices=["constant", "exponential", "snr"],
+        help="The scheduling method for Huber loss (constant, exponential, or SNR-based). Only used when loss_type is 'huber' or 'smooth_l1'. default is exponential"
+        + " / Huber損失のスケジューリング方法（constant、exponential、またはSNRベース）。loss_typeが'huber'または'smooth_l1'の場合に有効、デフォルトはexponential",
+    )
+    parser.add_argument(
+        "--huber_c",
+        type=float,
+        default=0.1,
+        help="The huber loss parameter. Only used if one of the huber loss modes (huber or smooth l1) is selected with loss_type. default is 0.1 / Huber損失のパラメータ。loss_typeがhuberまたはsmooth l1の場合に有効。デフォルトは0.1",
     )
 
     parser.add_argument(
@@ -3318,6 +3358,74 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         )
 
 
+def add_masked_loss_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "--conditioning_data_dir",
+        type=str,
+        default=None,
+        help="conditioning data directory / 条件付けデータのディレクトリ",
+    )
+    parser.add_argument(
+        "--masked_loss",
+        action="store_true",
+        help="apply mask for calculating loss. conditioning_data_dir is required for dataset. / 損失計算時にマスクを適用する。datasetにはconditioning_data_dirが必要",
+    )
+
+
+# verify command line args for training
+def verify_command_line_training_args(args: argparse.Namespace):
+    # if wandb is enabled, the command line is exposed to the public
+    # check whether sensitive options are included in the command line arguments
+    # if so, warn or inform the user to move them to the configuration file
+    # wandbが有効な場合、コマンドラインが公開される
+    # 学習用のコマンドライン引数に敏感なオプションが含まれているかどうかを確認し、
+    # 含まれている場合は設定ファイルに移動するようにユーザーに警告または通知する
+
+    wandb_enabled = args.log_with is not None and args.log_with != "tensorboard"  # "all" or "wandb"
+    if not wandb_enabled:
+        return
+
+    sensitive_args = ["wandb_api_key", "huggingface_token"]
+    sensitive_path_args = [
+        "pretrained_model_name_or_path",
+        "vae",
+        "tokenizer_cache_dir",
+        "train_data_dir",
+        "conditioning_data_dir",
+        "reg_data_dir",
+        "output_dir",
+        "logging_dir",
+    ]
+
+    for arg in sensitive_args:
+        if getattr(args, arg, None) is not None:
+            logger.warning(
+                f"wandb is enabled, but option `{arg}` is included in the command line. Because the command line is exposed to the public, it is recommended to move it to the `.toml` file."
+                + f" / wandbが有効で、かつオプション `{arg}` がコマンドラインに含まれています。コマンドラインは公開されるため、`.toml`ファイルに移動することをお勧めします。"
+            )
+
+    # if path is absolute, it may include sensitive information
+    for arg in sensitive_path_args:
+        if getattr(args, arg, None) is not None and os.path.isabs(getattr(args, arg)):
+            logger.info(
+                f"wandb is enabled, but option `{arg}` is included in the command line and it is an absolute path. Because the command line is exposed to the public, it is recommended to move it to the `.toml` file or use relative path."
+                + f" / wandbが有効で、かつオプション `{arg}` がコマンドラインに含まれており、絶対パスです。コマンドラインは公開されるため、`.toml`ファイルに移動するか、相対パスを使用することをお勧めします。"
+            )
+
+    if getattr(args, "config_file", None) is not None:
+        logger.info(
+            f"wandb is enabled, but option `config_file` is included in the command line. Because the command line is exposed to the public, please be careful about the information included in the path."
+            + f" / wandbが有効で、かつオプション `config_file` がコマンドラインに含まれています。コマンドラインは公開されるため、パスに含まれる情報にご注意ください。"
+        )
+
+    # other sensitive options
+    if args.huggingface_repo_id is not None and args.huggingface_repo_visibility != "public":
+        logger.info(
+            f"wandb is enabled, but option huggingface_repo_id is included in the command line and huggingface_repo_visibility is not 'public'. Because the command line is exposed to the public, it is recommended to move it to the `.toml` file."
+            + f" / wandbが有効で、かつオプション huggingface_repo_id がコマンドラインに含まれており、huggingface_repo_visibility が 'public' ではありません。コマンドラインは公開されるため、`.toml`ファイルに移動することをお勧めします。"
+        )
+
+
 def verify_training_args(args: argparse.Namespace):
     r"""
     Verify training arguments. Also reflect highvram option to global variable
@@ -3398,6 +3506,12 @@ def add_dataset_arguments(
     )
     parser.add_argument(
         "--train_data_dir", type=str, default=None, help="directory for train images / 学習画像データのディレクトリ"
+    )
+    parser.add_argument(
+        "--cache_info",
+        action="store_true",
+        help="cache meta information (caption and image size) for faster dataset loading. only available for DreamBooth"
+        + " / メタ情報（キャプションとサイズ）をキャッシュしてデータセット読み込みを高速化する。DreamBooth方式のみ有効",
     )
     parser.add_argument(
         "--shuffle_caption", action="store_true", help="shuffle separated caption / 区切られたcaptionの各要素をshuffleする"
@@ -4136,6 +4250,10 @@ def load_tokenizer(args: argparse.Namespace):
 
 
 def prepare_accelerator(args: argparse.Namespace):
+    """
+    this function also prepares deepspeed plugin
+    """
+
     if args.logging_dir is None:
         logging_dir = None
     else:
@@ -4181,6 +4299,8 @@ def prepare_accelerator(args: argparse.Namespace):
         ),
     )
     kwargs_handlers = list(filter(lambda x: x is not None, kwargs_handlers))
+    deepspeed_plugin = deepspeed_utils.prepare_deepspeed_plugin(args)
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -4188,6 +4308,7 @@ def prepare_accelerator(args: argparse.Namespace):
         project_dir=logging_dir,
         kwargs_handlers=kwargs_handlers,
         dynamo_backend=dynamo_backend,
+        deepspeed_plugin=deepspeed_plugin,
     )
     print("accelerator device:", accelerator.device)
     return accelerator
@@ -4258,7 +4379,6 @@ def _load_target_model(args: argparse.Namespace, weight_dtype, device="cpu", une
 
 
 def load_target_model(args, weight_dtype, accelerator, unet_use_linear_projection_in_v2=False):
-    # load models for each process
     for pi in range(accelerator.state.num_processes):
         if pi == accelerator.state.local_process_index:
             logger.info(f"loading model for process {accelerator.state.local_process_index}/{accelerator.state.num_processes}")
@@ -4269,7 +4389,6 @@ def load_target_model(args, weight_dtype, accelerator, unet_use_linear_projectio
                 accelerator.device if args.lowram else "cpu",
                 unet_use_linear_projection_in_v2=unet_use_linear_projection_in_v2,
             )
-
             # work on low-ram device
             if args.lowram:
                 text_encoder.to(accelerator.device)
@@ -4278,7 +4397,6 @@ def load_target_model(args, weight_dtype, accelerator, unet_use_linear_projectio
 
             clean_memory_on_device(accelerator.device)
         accelerator.wait_for_everyone()
-
     return text_encoder, vae, unet, load_stable_diffusion_format
 
 
@@ -4745,6 +4863,38 @@ def save_sd_model_on_train_end_common(
             huggingface_util.upload(args, out_dir, "/" + model_name, force_sync_upload=True)
 
 
+def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, device):
+
+    # TODO: if a huber loss is selected, it will use constant timesteps for each batch
+    # as. In the future there may be a smarter way
+
+    if args.loss_type == "huber" or args.loss_type == "smooth_l1":
+        timesteps = torch.randint(min_timestep, max_timestep, (1,), device="cpu")
+        timestep = timesteps.item()
+
+        if args.huber_schedule == "exponential":
+            alpha = -math.log(args.huber_c) / noise_scheduler.config.num_train_timesteps
+            huber_c = math.exp(-alpha * timestep)
+        elif args.huber_schedule == "snr":
+            alphas_cumprod = noise_scheduler.alphas_cumprod[timestep]
+            sigmas = ((1.0 - alphas_cumprod) / alphas_cumprod) ** 0.5
+            huber_c = (1 - args.huber_c) / (1 + sigmas) ** 2 + args.huber_c
+        elif args.huber_schedule == "constant":
+            huber_c = args.huber_c
+        else:
+            raise NotImplementedError(f"Unknown Huber loss schedule {args.huber_schedule}!")
+
+        timesteps = timesteps.repeat(b_size).to(device)
+    elif args.loss_type == "l2":
+        timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device=device)
+        huber_c = 1  # may be anything, as it's not used
+    else:
+        raise NotImplementedError(f"Unknown loss type {args.loss_type}")
+    timesteps = timesteps.long()
+
+    return timesteps, huber_c
+
+
 def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
     # Sample noise that we'll add to the latents
     noise = torch.randn_like(latents, device=latents.device)
@@ -4764,8 +4914,7 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
     min_timestep = 0 if args.min_timestep is None else args.min_timestep
     max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
 
-    timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device=latents.device)
-    timesteps = timesteps.long()
+    timesteps, huber_c = get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, latents.device)
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
@@ -4778,7 +4927,31 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
     else:
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-    return noise, noisy_latents, timesteps
+    return noise, noisy_latents, timesteps, huber_c
+
+
+# NOTE: if you're using the scheduled version, huber_c has to depend on the timesteps already
+def conditional_loss(
+    model_pred: torch.Tensor, target: torch.Tensor, reduction: str = "mean", loss_type: str = "l2", huber_c: float = 0.1
+):
+
+    if loss_type == "l2":
+        loss = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
+    elif loss_type == "huber":
+        loss = 2 * huber_c * (torch.sqrt((model_pred - target) ** 2 + huber_c**2) - huber_c)
+        if reduction == "mean":
+            loss = torch.mean(loss)
+        elif reduction == "sum":
+            loss = torch.sum(loss)
+    elif loss_type == "smooth_l1":
+        loss = 2 * (torch.sqrt((model_pred - target) ** 2 + huber_c**2) - huber_c)
+        if reduction == "mean":
+            loss = torch.mean(loss)
+        elif reduction == "sum":
+            loss = torch.sum(loss)
+    else:
+        raise NotImplementedError(f"Unsupported Loss Type {loss_type}")
+    return loss
 
 
 def append_lr_to_logs(logs, lr_scheduler, optimizer_type, including_unet=True):
