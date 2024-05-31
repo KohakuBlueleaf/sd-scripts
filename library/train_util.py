@@ -3026,7 +3026,7 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--max_token_length",
         type=int,
         default=None,
-        choices=[None, 150, 225],
+        choices=[None, 150, 225, 300, 375],
         help="max token length of text encoder (default for 75, 150 or 225) / text encoderのトークンの最大長（未指定で75、150または225が指定可）",
     )
     parser.add_argument(

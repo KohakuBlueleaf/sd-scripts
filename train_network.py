@@ -6,7 +6,6 @@ import sys
 import random
 import time
 import json
-import pickle
 from multiprocessing import Value
 import toml
 
@@ -511,7 +510,7 @@ class NetworkTrainer:
             if os.path.exists(train_state_file):
                 with open(train_state_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                steps_from_state = data["current_step"] + 1  # because
+                steps_from_state = data["current_step"]
                 logger.info(f"load train state from {train_state_file}: {data}")
 
         accelerator.register_save_state_pre_hook(save_model_hook)
@@ -796,11 +795,11 @@ class NetworkTrainer:
                         f"initial_step is specified but not resuming. lr scheduler will be started from the beginning / initial_stepが指定されていますがresumeしていないため、lr schedulerは最初から始まります"
                     )
                 logger.info(f"skipping {initial_step} steps / {initial_step}ステップをスキップします")
-                initial_step *= accelerator.num_processes * args.gradient_accumulation_steps
+                initial_step *= args.gradient_accumulation_steps
             else:
                 # if not, only epoch no is skipped for informative purpose
                 epoch_to_start = initial_step // math.ceil(
-                    len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
+                    len(train_dataloader) / args.gradient_accumulation_steps
                 )
                 initial_step = 0  # do not skip
 
@@ -862,7 +861,7 @@ class NetworkTrainer:
         # training loop
         if initial_step > 0:
             # set starting global step calculated from initial_step. because skipping steps doesn't increment global_step
-            global_step = initial_step // (accelerator.num_processes * args.gradient_accumulation_steps)
+            global_step = initial_step // args.gradient_accumulation_steps
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
@@ -877,12 +876,14 @@ class NetworkTrainer:
 
             accelerator.unwrap_model(network).on_epoch_start(text_encoder, unet)
 
-            for step, batch in enumerate(train_dataloader):
-                current_step.value = global_step
+            skipped_dataloader = None
+            if initial_step > 0:
+                skipped_dataloader = accelerator.skip_first_batches(train_dataloader, initial_step-1)
+                initial_step = 1
 
+            for step, batch in enumerate(skipped_dataloader or train_dataloader):
+                current_step.value = global_step
                 if initial_step > 0:
-                    # logger.info(f"skipping step {step+1} because initial_step (multiplied) is {initial_step}")
-                    loss_recorder.add(epoch=epoch, step=step, loss=0)  # add dummy loss
                     initial_step -= 1
                     continue
 
@@ -992,6 +993,9 @@ class NetworkTrainer:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    for key in list(batch.keys()):
+                        del batch[key]
+                    del batch
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
