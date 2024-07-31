@@ -70,6 +70,7 @@ from library.lpw_stable_diffusion import StableDiffusionLongPromptWeightingPipel
 import library.model_util as model_util
 import library.huggingface_util as huggingface_util
 import library.sai_model_spec as sai_model_spec
+import library.deepspeed_utils as deepspeed_utils
 from library.utils import setup_logging
 
 setup_logging()
@@ -158,6 +159,7 @@ class ImageInfo:
         self.text_encoder_outputs1: Optional[torch.Tensor] = None
         self.text_encoder_outputs2: Optional[torch.Tensor] = None
         self.text_encoder_pool2: Optional[torch.Tensor] = None
+        self.alpha_mask: Optional[torch.Tensor] = None  # alpha mask can be flipped in runtime
 
 
 class BucketManager:
@@ -360,6 +362,7 @@ class BaseSubset:
     def __init__(
         self,
         image_dir: Optional[str],
+        alpha_mask: Optional[bool],
         num_repeats: int,
         shuffle_caption: bool,
         caption_separator: str,
@@ -380,6 +383,7 @@ class BaseSubset:
         token_warmup_step: Union[float, int],
     ) -> None:
         self.image_dir = image_dir
+        self.alpha_mask = alpha_mask if alpha_mask is not None else False
         self.num_repeats = num_repeats
         self.shuffle_caption = shuffle_caption
         self.caption_separator = caption_separator
@@ -410,6 +414,8 @@ class DreamBoothSubset(BaseSubset):
         is_reg: bool,
         class_tokens: Optional[str],
         caption_extension: str,
+        cache_info: bool,
+        alpha_mask: bool,
         num_repeats,
         shuffle_caption,
         caption_separator: str,
@@ -433,6 +439,7 @@ class DreamBoothSubset(BaseSubset):
 
         super().__init__(
             image_dir,
+            alpha_mask,
             num_repeats,
             shuffle_caption,
             caption_separator,
@@ -458,6 +465,7 @@ class DreamBoothSubset(BaseSubset):
         self.caption_extension = caption_extension
         if self.caption_extension and not self.caption_extension.startswith("."):
             self.caption_extension = "." + self.caption_extension
+        self.cache_info = cache_info
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, DreamBoothSubset):
@@ -470,6 +478,7 @@ class FineTuningSubset(BaseSubset):
         self,
         image_dir,
         metadata_file: str,
+        alpha_mask: bool,
         num_repeats,
         shuffle_caption,
         caption_separator,
@@ -493,6 +502,7 @@ class FineTuningSubset(BaseSubset):
 
         super().__init__(
             image_dir,
+            alpha_mask,
             num_repeats,
             shuffle_caption,
             caption_separator,
@@ -527,6 +537,7 @@ class ControlNetSubset(BaseSubset):
         image_dir: str,
         conditioning_data_dir: str,
         caption_extension: str,
+        cache_info: bool,
         num_repeats,
         shuffle_caption,
         caption_separator,
@@ -550,6 +561,7 @@ class ControlNetSubset(BaseSubset):
 
         super().__init__(
             image_dir,
+            False,  # alpha_mask
             num_repeats,
             shuffle_caption,
             caption_separator,
@@ -574,6 +586,7 @@ class ControlNetSubset(BaseSubset):
         self.caption_extension = caption_extension
         if self.caption_extension and not self.caption_extension.startswith("."):
             self.caption_extension = "." + self.caption_extension
+        self.cache_info = cache_info
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, ControlNetSubset):
@@ -644,8 +657,16 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def set_current_epoch(self, epoch):
         if not self.current_epoch == epoch:  # epochが切り替わったらバケツをシャッフルする
-            self.shuffle_buckets()
-        self.current_epoch = epoch
+            if epoch > self.current_epoch:
+                logger.info("epoch is incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
+                num_epochs = epoch - self.current_epoch
+                for _ in range(num_epochs):
+                    self.current_epoch += 1
+                    self.shuffle_buckets()
+                # self.current_epoch seem to be set to 0 again in the next epoch. it may be caused by skipped_dataloader?
+            else:
+                logger.warning("epoch is not incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
+                self.current_epoch = epoch
 
     def set_current_step(self, step):
         self.current_step = step
@@ -694,6 +715,10 @@ class BaseDataset(torch.utils.data.Dataset):
         else:
             # process wildcards
             if subset.enable_wildcard:
+                # if caption is multiline, random choice one line
+                if "\n" in caption:
+                    caption = random.choice(caption.split("\n"))
+
                 # wildcard is like '{aaa|bbb|ccc...}'
                 # escape the curly braces like {{ or }}
                 replacer1 = "⦅"
@@ -712,6 +737,9 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 # unescape the curly braces
                 caption = caption.replace(replacer1, "{").replace(replacer2, "}")
+            else:
+                # if caption is multiline, use the first line
+                caption = caption.split("\n")[0]
 
             if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
                 fixed_tokens = []
@@ -903,7 +931,7 @@ class BaseDataset(torch.utils.data.Dataset):
             logger.info(f"mean ar error (without repeats): {mean_img_ar_error}")
 
         # データ参照用indexを作る。このindexはdatasetのshuffleに用いられる
-        self.buckets_indices: List(BucketBatchIndex) = []
+        self.buckets_indices: List[BucketBatchIndex] = []
         for bucket_index, bucket in enumerate(self.bucket_manager.buckets):
             batch_count = int(math.ceil(len(bucket) / self.batch_size))
             for batch_index in range(batch_count):
@@ -982,7 +1010,9 @@ class BaseDataset(torch.utils.data.Dataset):
                 if not is_main_process:  # store to info only
                     continue
 
-                cache_available = is_disk_cached_latents_is_expected(info.bucket_reso, info.latents_npz, subset.flip_aug)
+                cache_available = is_disk_cached_latents_is_expected(
+                    info.bucket_reso, info.latents_npz, subset.flip_aug, subset.alpha_mask
+                )
 
                 if cache_available:  # do not add to batch
                     continue
@@ -1008,7 +1038,7 @@ class BaseDataset(torch.utils.data.Dataset):
         # iterate batches: batch doesn't have image, image will be loaded in cache_batch_latents and discarded
         logger.info("caching latents...")
         for batch in tqdm(batches, smoothing=1, total=len(batches)):
-            cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.random_crop)
+            cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.alpha_mask, subset.random_crop)
 
     # weight_dtypeを指定するとText Encoderそのもの、およひ出力がweight_dtypeになる
     # SDXLでのみ有効だが、datasetのメソッドとする必要があるので、sdxl_train_util.pyではなくこちらに実装する
@@ -1076,8 +1106,8 @@ class BaseDataset(torch.utils.data.Dataset):
     def get_image_size(self, image_path):
         return imagesize.get(image_path)
 
-    def load_image_with_face_info(self, subset: BaseSubset, image_path: str):
-        img = load_image(image_path)
+    def load_image_with_face_info(self, subset: BaseSubset, image_path: str, alpha_mask=False):
+        img = load_image(image_path, alpha_mask)
 
         face_cx = face_cy = face_w = face_h = 0
         if subset.face_crop_aug_range is not None:
@@ -1154,6 +1184,7 @@ class BaseDataset(torch.utils.data.Dataset):
         input_ids_list = []
         input_ids2_list = []
         latents_list = []
+        alpha_mask_list = []
         images = []
         original_sizes_hw = []
         crop_top_lefts = []
@@ -1178,21 +1209,28 @@ class BaseDataset(torch.utils.data.Dataset):
                 crop_ltrb = image_info.latents_crop_ltrb  # calc values later if flipped
                 if not flipped:
                     latents = image_info.latents
+                    alpha_mask = image_info.alpha_mask
                 else:
                     latents = image_info.latents_flipped
+                    alpha_mask = None if image_info.alpha_mask is None else torch.flip(image_info.alpha_mask, [1])
 
                 image = None
             elif image_info.latents_npz is not None:  # FineTuningDatasetまたはcache_latents_to_disk=Trueの場合
-                latents, original_size, crop_ltrb, flipped_latents = load_latents_from_disk(image_info.latents_npz)
+                latents, original_size, crop_ltrb, flipped_latents, alpha_mask = load_latents_from_disk(image_info.latents_npz)
                 if flipped:
                     latents = flipped_latents
+                    alpha_mask = None if alpha_mask is None else alpha_mask[:, ::-1].copy()  # copy to avoid negative stride problem
                     del flipped_latents
                 latents = torch.FloatTensor(latents)
+                if alpha_mask is not None:
+                    alpha_mask = torch.FloatTensor(alpha_mask)
 
                 image = None
             else:
                 # 画像を読み込み、必要ならcropする
-                img, face_cx, face_cy, face_w, face_h = self.load_image_with_face_info(subset, image_info.absolute_path)
+                img, face_cx, face_cy, face_w, face_h = self.load_image_with_face_info(
+                    subset, image_info.absolute_path, subset.alpha_mask
+                )
                 im_h, im_w = img.shape[0:2]
 
                 if self.enable_bucket:
@@ -1224,16 +1262,33 @@ class BaseDataset(torch.utils.data.Dataset):
                 # augmentation
                 aug = self.aug_helper.get_augmentor(subset.color_aug)
                 if aug is not None:
-                    img = aug(image=img)["image"]
+                    # augment RGB channels only
+                    img_rgb = img[:, :, :3]
+                    img_rgb = aug(image=img_rgb)["image"]
+                    img[:, :, :3] = img_rgb
 
                 if flipped:
                     img = img[:, ::-1, :].copy()  # copy to avoid negative stride problem
 
+                if subset.alpha_mask:
+                    if img.shape[2] == 4:
+                        alpha_mask = img[:, :, 3]  # [H,W]
+                        alpha_mask = alpha_mask.astype(np.float32) / 255.0  # 0.0~1.0
+                        alpha_mask = torch.FloatTensor(alpha_mask)
+                    else:
+                        alpha_mask = torch.ones((img.shape[0], img.shape[1]), dtype=torch.float32)
+                else:
+                    alpha_mask = None
+
+                img = img[:, :, :3]  # remove alpha channel
+
                 latents = None
                 image = self.image_transforms(img)  # -1.0~1.0のtorch.Tensorになる
+                del img
 
             images.append(image)
             latents_list.append(latents)
+            alpha_mask_list.append(alpha_mask)
 
             target_size = (image.shape[2], image.shape[1]) if image is not None else (latents.shape[2] * 8, latents.shape[1] * 8)
 
@@ -1319,6 +1374,23 @@ class BaseDataset(torch.utils.data.Dataset):
             example["text_encoder_outputs2_list"] = torch.stack(text_encoder_outputs2_list)
             example["text_encoder_pool2_list"] = torch.stack(text_encoder_pool2_list)
 
+        # if one of alpha_masks is not None, we need to replace None with ones
+        none_or_not = [x is None for x in alpha_mask_list]
+        if all(none_or_not):
+            example["alpha_masks"] = None
+        elif any(none_or_not):
+            for i in range(len(alpha_mask_list)):
+                if alpha_mask_list[i] is None:
+                    if images[i] is not None:
+                        alpha_mask_list[i] = torch.ones((images[i].shape[1], images[i].shape[2]), dtype=torch.float32)
+                    else:
+                        alpha_mask_list[i] = torch.ones(
+                            (latents_list[i].shape[1] * 8, latents_list[i].shape[2] * 8), dtype=torch.float32
+                        )
+            example["alpha_masks"] = torch.stack(alpha_mask_list)
+        else:
+            example["alpha_masks"] = torch.stack(alpha_mask_list)
+
         if images[0] is not None:
             images = torch.stack(images)
             images = images.to(memory_format=torch.contiguous_format).float()
@@ -1349,6 +1421,7 @@ class BaseDataset(torch.utils.data.Dataset):
         resized_sizes = []
         bucket_reso = None
         flip_aug = None
+        alpha_mask = None
         random_crop = None
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
@@ -1357,10 +1430,13 @@ class BaseDataset(torch.utils.data.Dataset):
 
             if flip_aug is None:
                 flip_aug = subset.flip_aug
+                alpha_mask = subset.alpha_mask
                 random_crop = subset.random_crop
                 bucket_reso = image_info.bucket_reso
             else:
+                # TODO そもそも混在してても動くようにしたほうがいい
                 assert flip_aug == subset.flip_aug, "flip_aug must be same in a batch"
+                assert alpha_mask == subset.alpha_mask, "alpha_mask must be same in a batch"
                 assert random_crop == subset.random_crop, "random_crop must be same in a batch"
                 assert bucket_reso == image_info.bucket_reso, "bucket_reso must be same in a batch"
 
@@ -1397,12 +1473,15 @@ class BaseDataset(torch.utils.data.Dataset):
         example["absolute_paths"] = absolute_paths
         example["resized_sizes"] = resized_sizes
         example["flip_aug"] = flip_aug
+        example["alpha_mask"] = alpha_mask
         example["random_crop"] = random_crop
         example["bucket_reso"] = bucket_reso
         return example
 
 
 class DreamBoothDataset(BaseDataset):
+    IMAGE_INFO_CACHE_FILE = "metadata_cache.json"
+
     def __init__(
         self,
         subsets: Sequence[DreamBoothSubset],
@@ -1448,7 +1527,7 @@ class DreamBoothDataset(BaseDataset):
             self.bucket_reso_steps = None  # この情報は使われない
             self.bucket_no_upscale = False
 
-        def read_caption(img_path, caption_extension):
+        def read_caption(img_path, caption_extension, enable_wildcard):
             # captionの候補ファイル名を作る
             base_name = os.path.splitext(img_path)[0]
             base_name_face_det = base_name
@@ -1467,7 +1546,10 @@ class DreamBoothDataset(BaseDataset):
                             logger.error(f"illegal char in file (not UTF-8) / ファイルにUTF-8以外の文字があります: {cap_path}")
                             raise e
                         assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {cap_path}"
-                        caption = lines[0].strip()
+                        if enable_wildcard:
+                            caption = "\n".join([line.strip() for line in lines if line.strip() != ""])  # 空行を除く、改行で連結
+                        else:
+                            caption = lines[0].strip()
                     break
             return caption
 
@@ -1476,31 +1558,42 @@ class DreamBoothDataset(BaseDataset):
                 logger.warning(f"not directory: {subset.image_dir}")
                 return [], []
 
-            sizes = None
-            if use_cached_meta:
-                logger.info(f"using cached metadata: {subset.image_dir}/dataset.txt")
-                # [img_path, caption, resolution]
-                with open(f"{subset.image_dir}/dataset.txt", "r", encoding="utf-8") as f:
-                    metas = f.readlines()
-                metas = [x.strip().split("<|##|>") for x in metas]
-                sizes = [tuple(int(res) for res in x[2].split(" ")) for x in metas]
-            
-            if use_cached_meta:
-                img_paths = [x[0] for x in metas]
+            info_cache_file = os.path.join(subset.image_dir, self.IMAGE_INFO_CACHE_FILE)
+            use_cached_info_for_subset = subset.cache_info
+            if use_cached_info_for_subset:
+                logger.info(
+                    f"using cached image info for this subset / このサブセットで、キャッシュされた画像情報を使います: {info_cache_file}"
+                )
+                if not os.path.isfile(info_cache_file):
+                    logger.warning(
+                        f"image info file not found. You can ignore this warning if this is the first time to use this subset"
+                        + " / キャッシュファイルが見つかりませんでした。初回実行時はこの警告を無視してください: {metadata_file}"
+                    )
+                    use_cached_info_for_subset = False
+
+            if use_cached_info_for_subset:
+                # json: {`img_path`:{"caption": "caption...", "resolution": [width, height]}, ...}
+                with open(info_cache_file, "r", encoding="utf-8") as f:
+                    metas = json.load(f)
+                img_paths = list(metas.keys())
+                sizes = [meta["resolution"] for meta in metas.values()]
+
+                # we may need to check image size and existence of image files, but it takes time, so user should check it before training
             else:
                 img_paths = glob_images(subset.image_dir, "*")
-                sizes = [None]*len(img_paths)
+                sizes = [None] * len(img_paths)
+
             logger.info(f"found directory {subset.image_dir} contains {len(img_paths)} image files")
 
-            if use_cached_meta:
-                captions = [x[1] for x in metas]
-                missing_captions = [x[0] for x in metas if x[1] == ""]
+            if use_cached_info_for_subset:
+                captions = [meta["caption"] for meta in metas.values()]
+                missing_captions = [img_path for img_path, caption in zip(img_paths, captions) if caption is None or caption == ""]
             else:
                 # 画像ファイルごとにプロンプトを読み込み、もしあればそちらを使う
                 captions = []
                 missing_captions = []
                 for img_path in img_paths:
-                    cap_for_img = read_caption(img_path, subset.caption_extension)
+                    cap_for_img = read_caption(img_path, subset.caption_extension, subset.enable_wildcard)
                     if cap_for_img is None and subset.class_tokens is None:
                         logger.warning(
                             f"neither caption file nor class tokens are found. use empty caption for {img_path} / キャプションファイルもclass tokenも見つかりませんでした。空のキャプションを使用します: {img_path}"
@@ -1530,25 +1623,23 @@ class DreamBoothDataset(BaseDataset):
                         break
                     logger.warning(missing_caption)
 
-            if cache_meta:
-                logger.info(f"cache metadata for {subset.image_dir}")
-                if sizes is None or sizes[0] is None:
-                    sizes = [self.get_image_size(img_path) for img_path in img_paths]
-                # [img_path, caption, resolution]
-                data = [
-                    (img_path, caption, " ".join(str(x) for x in size))
-                    for img_path, caption, size in zip(img_paths, captions, sizes)
-                ]
-                with open(f"{subset.image_dir}/dataset.txt", "w", encoding="utf-8") as f:
-                    f.write("\n".join(["<|##|>".join(x) for x in data]))
-                logger.info(f"cache metadata done for {subset.image_dir}")
+            if not use_cached_info_for_subset and subset.cache_info:
+                logger.info(f"cache image info for / 画像情報をキャッシュします : {info_cache_file}")
+                sizes = [self.get_image_size(img_path) for img_path in tqdm(img_paths, desc="get image size")]
+                matas = {}
+                for img_path, caption, size in zip(img_paths, captions, sizes):
+                    matas[img_path] = {"caption": caption, "resolution": list(size)}
+                with open(info_cache_file, "w", encoding="utf-8") as f:
+                    json.dump(matas, f, ensure_ascii=False, indent=2)
+                logger.info(f"cache image info done for / 画像情報を出力しました : {info_cache_file}")
 
+            # if sizes are not set, image size will be read in make_buckets
             return img_paths, captions, sizes
 
         logger.info("prepare images.")
         num_train_images = 0
         num_reg_images = 0
-        reg_infos: List[ImageInfo] = []
+        reg_infos: List[Tuple[ImageInfo, DreamBoothSubset]] = []
         for subset in subsets:
             if subset.num_repeats < 1:
                 logger.warning(
@@ -1579,7 +1670,7 @@ class DreamBoothDataset(BaseDataset):
                 if size is not None:
                     info.image_size = size
                 if subset.is_reg:
-                    reg_infos.append(info)
+                    reg_infos.append((info, subset))
                 else:
                     self.register_image(info, subset)
 
@@ -1600,7 +1691,7 @@ class DreamBoothDataset(BaseDataset):
             n = 0
             first_loop = True
             while n < num_train_images:
-                for info in reg_infos:
+                for info, subset in reg_infos:
                     if first_loop:
                         self.register_image(info, subset)
                         n += info.num_repeats
@@ -1692,10 +1783,24 @@ class FineTuningDataset(BaseDataset):
                 caption = img_md.get("caption")
                 tags = img_md.get("tags")
                 if caption is None:
-                    caption = tags
-                elif tags is not None and len(tags) > 0:
-                    caption = caption + ", " + tags
-                    tags_list.append(tags)
+                    caption = tags  # could be multiline
+                    tags = None
+
+                if subset.enable_wildcard:
+                    # tags must be single line
+                    if tags is not None:
+                        tags = tags.replace("\n", subset.caption_separator)
+
+                    # add tags to each line of caption
+                    if caption is not None and tags is not None:
+                        caption = "\n".join(
+                            [f"{line}{subset.caption_separator}{tags}" for line in caption.split("\n") if line.strip() != ""]
+                        )
+                else:
+                    # use as is
+                    if tags is not None and len(tags) > 0:
+                        caption = caption + subset.caption_separator + tags
+                        tags_list.append(tags)
 
                 if caption is None:
                     caption = ""
@@ -1845,11 +1950,16 @@ class ControlNetDataset(BaseDataset):
 
         db_subsets = []
         for subset in subsets:
+            assert (
+                not subset.random_crop
+            ), "random_crop is not supported in ControlNetDataset / random_cropはControlNetDatasetではサポートされていません"
             db_subset = DreamBoothSubset(
                 subset.image_dir,
                 False,
                 None,
                 subset.caption_extension,
+                subset.cache_info,
+                False,
                 subset.num_repeats,
                 subset.shuffle_caption,
                 subset.caption_separator,
@@ -1895,7 +2005,7 @@ class ControlNetDataset(BaseDataset):
 
         # assert all conditioning data exists
         missing_imgs = []
-        cond_imgs_with_img = set()
+        cond_imgs_with_pair = set()
         for image_key, info in self.dreambooth_dataset_delegate.image_data.items():
             db_subset = self.dreambooth_dataset_delegate.image_to_subset[image_key]
             subset = None
@@ -1909,23 +2019,29 @@ class ControlNetDataset(BaseDataset):
                 logger.warning(f"not directory: {subset.conditioning_data_dir}")
                 continue
 
-            img_basename = os.path.basename(info.absolute_path)
-            ctrl_img_path = os.path.join(subset.conditioning_data_dir, img_basename)
-            if not os.path.exists(ctrl_img_path):
+            img_basename = os.path.splitext(os.path.basename(info.absolute_path))[0]
+            ctrl_img_path = glob_images(subset.conditioning_data_dir, img_basename)
+            if len(ctrl_img_path) < 1:
                 missing_imgs.append(img_basename)
+                continue
+            ctrl_img_path = ctrl_img_path[0]
+            ctrl_img_path = os.path.abspath(ctrl_img_path)  # normalize path
 
             info.cond_img_path = ctrl_img_path
-            cond_imgs_with_img.add(ctrl_img_path)
+            cond_imgs_with_pair.add(os.path.splitext(ctrl_img_path)[0])  # remove extension because Windows is case insensitive
 
         extra_imgs = []
         for subset in subsets:
             conditioning_img_paths = glob_images(subset.conditioning_data_dir, "*")
-            extra_imgs.extend(
-                [cond_img_path for cond_img_path in conditioning_img_paths if cond_img_path not in cond_imgs_with_img]
-            )
+            conditioning_img_paths = [os.path.abspath(p) for p in conditioning_img_paths]  # normalize path
+            extra_imgs.extend([p for p in conditioning_img_paths if os.path.splitext(p)[0] not in cond_imgs_with_pair])
 
-        assert len(missing_imgs) == 0, f"missing conditioning data for {len(missing_imgs)} images: {missing_imgs}"
-        assert len(extra_imgs) == 0, f"extra conditioning data for {len(extra_imgs)} images: {extra_imgs}"
+        assert (
+            len(missing_imgs) == 0
+        ), f"missing conditioning data for {len(missing_imgs)} images / 制御用画像が見つかりませんでした: {missing_imgs}"
+        assert (
+            len(extra_imgs) == 0
+        ), f"extra conditioning data for {len(extra_imgs)} images / 余分な制御用画像があります: {extra_imgs}"
 
         self.conditioning_image_transforms = IMAGE_TRANSFORMS
 
@@ -2069,23 +2185,36 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
             dataset.disable_token_padding()
 
 
-def is_disk_cached_latents_is_expected(reso, npz_path: str, flip_aug: bool):
+def is_disk_cached_latents_is_expected(reso, npz_path: str, flip_aug: bool, alpha_mask: bool):
     expected_latents_size = (reso[1] // 8, reso[0] // 8)  # bucket_resoはWxHなので注意
 
     if not os.path.exists(npz_path):
         return False
 
-    npz = np.load(npz_path)
-    if "latents" not in npz or "original_size" not in npz or "crop_ltrb" not in npz:  # old ver?
-        return False
-    if npz["latents"].shape[1:3] != expected_latents_size:
-        return False
+    try:
+        npz = np.load(npz_path)
+        if "latents" not in npz or "original_size" not in npz or "crop_ltrb" not in npz:  # old ver?
+            return False
+        if npz["latents"].shape[1:3] != expected_latents_size:
+            return False
 
-    if flip_aug:
-        if "latents_flipped" not in npz:
-            return False
-        if npz["latents_flipped"].shape[1:3] != expected_latents_size:
-            return False
+        if flip_aug:
+            if "latents_flipped" not in npz:
+                return False
+            if npz["latents_flipped"].shape[1:3] != expected_latents_size:
+                return False
+
+        if alpha_mask:
+            if "alpha_mask" not in npz:
+                return False
+            if npz["alpha_mask"].shape[0:2] != reso:  # HxW
+                return False
+        else:
+            if "alpha_mask" in npz:
+                return False
+    except Exception as e:
+        logger.error(f"Error loading file: {npz_path}")
+        raise e
 
     return True
 
@@ -2093,7 +2222,7 @@ def is_disk_cached_latents_is_expected(reso, npz_path: str, flip_aug: bool):
 # 戻り値は、latents_tensor, (original_size width, original_size height), (crop left, crop top)
 def load_latents_from_disk(
     npz_path,
-) -> Tuple[Optional[torch.Tensor], Optional[List[int]], Optional[List[int]], Optional[torch.Tensor]]:
+) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
     npz = np.load(npz_path)
     if "latents" not in npz:
         raise ValueError(f"error: npz is old format. please re-generate {npz_path}")
@@ -2102,13 +2231,16 @@ def load_latents_from_disk(
     original_size = npz["original_size"].tolist()
     crop_ltrb = npz["crop_ltrb"].tolist()
     flipped_latents = npz["latents_flipped"] if "latents_flipped" in npz else None
-    return latents, original_size, crop_ltrb, flipped_latents
+    alpha_mask = npz["alpha_mask"] if "alpha_mask" in npz else None
+    return latents, original_size, crop_ltrb, flipped_latents, alpha_mask
 
 
-def save_latents_to_disk(npz_path, latents_tensor, original_size, crop_ltrb, flipped_latents_tensor=None):
+def save_latents_to_disk(npz_path, latents_tensor, original_size, crop_ltrb, flipped_latents_tensor=None, alpha_mask=None):
     kwargs = {}
     if flipped_latents_tensor is not None:
         kwargs["latents_flipped"] = flipped_latents_tensor.float().cpu().numpy()
+    if alpha_mask is not None:
+        kwargs["alpha_mask"] = alpha_mask.float().cpu().numpy()
     np.savez(
         npz_path,
         latents=latents_tensor.float().cpu().numpy(),
@@ -2179,6 +2311,13 @@ def debug_dataset(train_dataset, show_input_ids=False):
                         cond_img = cond_img[:, :, ::-1]
                         if os.name == "nt":
                             cv2.imshow("cond_img", cond_img)
+
+                    if "alpha_masks" in example and example["alpha_masks"] is not None:
+                        alpha_mask = example["alpha_masks"][j]
+                        logger.info(f"alpha mask size: {alpha_mask.size()}")
+                        alpha_mask = (alpha_mask[0].numpy() * 255.0).astype(np.uint8)
+                        if os.name == "nt":
+                            cv2.imshow("alpha_mask", alpha_mask)
 
                     if os.name == "nt":  # only windows
                         cv2.imshow("img", im)
@@ -2297,17 +2436,25 @@ def load_arbitrary_dataset(args, tokenizer) -> MinimalDataset:
     return train_dataset_group
 
 
-def load_image(image_path):
-    image = Image.open(image_path)
-    if not image.mode == "RGB":
-        image = image.convert("RGB")
-    img = np.array(image, np.uint8)
-    return img
+def load_image(image_path, alpha=False):    
+    try:
+        with Image.open(image_path) as image:
+            if alpha:
+                if not image.mode == "RGBA":
+                    image = image.convert("RGBA")
+            else:
+                if not image.mode == "RGB":
+                    image = image.convert("RGB")
+            img = np.array(image, np.uint8)
+            return img
+    except (IOError, OSError) as e:
+        logger.error(f"Error loading file: {image_path}")
+        raise e
 
 
 # 画像を読み込む。戻り値はnumpy.ndarray,(original width, original height),(crop left, crop top, crop right, crop bottom)
 def trim_and_resize_if_required(
-    random_crop: bool, image: Image.Image, reso, resized_size: Tuple[int, int]
+    random_crop: bool, image: np.ndarray, reso, resized_size: Tuple[int, int]
 ) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int, int, int]]:
     image_height, image_width = image.shape[0:2]
     original_size = (image_width, image_height)  # size before resize
@@ -2339,7 +2486,7 @@ def trim_and_resize_if_required(
 
 
 def cache_batch_latents(
-    vae: AutoencoderKL, cache_to_disk: bool, image_infos: List[ImageInfo], flip_aug: bool, random_crop: bool
+    vae: AutoencoderKL, cache_to_disk: bool, image_infos: List[ImageInfo], flip_aug: bool, use_alpha_mask: bool, random_crop: bool
 ) -> None:
     r"""
     requires image_infos to have: absolute_path, bucket_reso, resized_size, latents_npz
@@ -2351,15 +2498,29 @@ def cache_batch_latents(
     latents_original_size and latents_crop_ltrb are also set
     """
     images = []
+    alpha_masks: List[np.ndarray] = []
     for info in image_infos:
-        image = load_image(info.absolute_path) if info.image is None else np.array(info.image, np.uint8)
+        image = load_image(info.absolute_path, use_alpha_mask) if info.image is None else np.array(info.image, np.uint8)
         # TODO 画像のメタデータが壊れていて、メタデータから割り当てたbucketと実際の画像サイズが一致しない場合があるのでチェック追加要
         image, original_size, crop_ltrb = trim_and_resize_if_required(random_crop, image, info.bucket_reso, info.resized_size)
-        image = IMAGE_TRANSFORMS(image)
-        images.append(image)
 
         info.latents_original_size = original_size
         info.latents_crop_ltrb = crop_ltrb
+
+        if use_alpha_mask:
+            if image.shape[2] == 4:
+                alpha_mask = image[:, :, 3]  # [H,W]
+                alpha_mask = alpha_mask.astype(np.float32) / 255.0
+                alpha_mask = torch.FloatTensor(alpha_mask)  # [H,W]
+            else:
+                alpha_mask = torch.ones_like(image[:, :, 0], dtype=torch.float32)  # [H,W]
+        else:
+            alpha_mask = None
+        alpha_masks.append(alpha_mask)
+
+        image = image[:, :, :3]  # remove alpha channel if exists
+        image = IMAGE_TRANSFORMS(image)
+        images.append(image)
 
     img_tensors = torch.stack(images, dim=0)
     img_tensors = img_tensors.to(device=vae.device, dtype=vae.dtype)
@@ -2374,17 +2535,25 @@ def cache_batch_latents(
     else:
         flipped_latents = [None] * len(latents)
 
-    for info, latent, flipped_latent in zip(image_infos, latents, flipped_latents):
+    for info, latent, flipped_latent, alpha_mask in zip(image_infos, latents, flipped_latents, alpha_masks):
         # check NaN
         if torch.isnan(latents).any() or (flipped_latent is not None and torch.isnan(flipped_latent).any()):
             raise RuntimeError(f"NaN detected in latents: {info.absolute_path}")
 
         if cache_to_disk:
-            save_latents_to_disk(info.latents_npz, latent, info.latents_original_size, info.latents_crop_ltrb, flipped_latent)
+            save_latents_to_disk(
+                info.latents_npz,
+                latent,
+                info.latents_original_size,
+                info.latents_crop_ltrb,
+                flipped_latent,
+                alpha_mask,
+            )
         else:
             info.latents = latent
             if flip_aug:
                 info.latents_flipped = flipped_latent
+            info.alpha_mask = alpha_mask
 
     if not HIGH_VRAM:
         clean_memory_on_device(vae.device)
@@ -2872,6 +3041,12 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
         default=1,
         help="Polynomial power for polynomial scheduler / polynomialスケジューラでのpolynomial power",
     )
+    parser.add_argument(
+        "--fused_backward_pass",
+        action="store_true",
+        help="Combines backward pass and optimizer step to reduce VRAM usage. Only available in SDXL"
+        + " / バックワードパスとオプティマイザステップを組み合わせてVRAMの使用量を削減します。SDXLでのみ有効",
+    )
 
 
 def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: bool):
@@ -2971,7 +3146,12 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
     parser.add_argument(
         "--save_state",
         action="store_true",
-        help="save training state additionally (including optimizer states etc.) / optimizerなど学習状態も含めたstateを追加で保存する",
+        help="save training state additionally (including optimizer states etc.) when saving model / optimizerなど学習状態も含めたstateをモデル保存時に追加で保存する",
+    )
+    parser.add_argument(
+        "--save_state_on_train_end",
+        action="store_true",
+        help="save training state (including optimizer states etc.) on train end / optimizerなど学習状態も含めたstateを学習完了時に保存する",
     )
     parser.add_argument("--resume", type=str, default=None, help="saved state to resume training / 学習再開するモデルのstate")
 
@@ -3034,7 +3214,7 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
     )
     parser.add_argument("--seed", type=int, default=None, help="random seed for training / 学習時の乱数のseed")
     parser.add_argument(
-        "--gradient_checkpointing", action="store_true", help="enable gradient checkpointing / grandient checkpointingを有効にする"
+        "--gradient_checkpointing", action="store_true", help="enable gradient checkpointing / gradient checkpointingを有効にする"
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -3054,6 +3234,7 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--full_bf16", action="store_true", help="bf16 training including gradients / 勾配も含めてbf16で学習する"
     )  # TODO move to SDXL training, because it is not supported by SD1/2
     parser.add_argument("--fp8_base", action="store_true", help="use fp8 for base model / base modelにfp8を使う")
+
     parser.add_argument(
         "--ddp_timeout",
         type=int,
@@ -3116,11 +3297,18 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         default=None,
         help="specify WandB API key to log in before starting training (optional). / WandB APIキーを指定して学習開始前にログインする（オプション）",
     )
+    parser.add_argument("--log_config", action="store_true", help="log training configuration / 学習設定をログに出力する")
+
     parser.add_argument(
         "--noise_offset",
         type=float,
         default=None,
         help="enable noise offset with this value (if enabled, around 0.1 is recommended) / Noise offsetを有効にしてこの値を設定する（有効にする場合は0.1程度を推奨）",
+    )
+    parser.add_argument(
+        "--noise_offset_random_strength",
+        action="store_true",
+        help="use random strength between 0~noise_offset for noise offset. / noise offsetにおいて、0からnoise_offsetの間でランダムな強度を使用します。",
     )
     parser.add_argument(
         "--multires_noise_iterations",
@@ -3134,6 +3322,12 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         default=None,
         help="enable input perturbation noise. used for regularization. recommended value: around 0.1 (from arxiv.org/abs/2301.11706) "
         + "/  input perturbation noiseを有効にする。正則化に使用される。推奨値: 0.1程度 (arxiv.org/abs/2301.11706 より)",
+    )
+    parser.add_argument(
+        "--ip_noise_gamma_random_strength",
+        action="store_true",
+        help="Use random strength between 0~ip_noise_gamma for input perturbation noise."
+        + "/ input perturbation noiseにおいて、0からip_noise_gammaの間でランダムな強度を使用します。",
     )
     # parser.add_argument(
     #     "--perlin_noise",
@@ -3169,6 +3363,27 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         type=int,
         default=None,
         help="set maximum time step for U-Net training (1~1000, default is 1000) / U-Net学習時のtime stepの最大値を設定する（1~1000で指定、省略時はデフォルト値(1000)）",
+    )
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="l2",
+        choices=["l2", "huber", "smooth_l1"],
+        help="The type of loss function to use (L2, Huber, or smooth L1), default is L2 / 使用する損失関数の種類（L2、Huber、またはsmooth L1）、デフォルトはL2",
+    )
+    parser.add_argument(
+        "--huber_schedule",
+        type=str,
+        default="snr",
+        choices=["constant", "exponential", "snr"],
+        help="The scheduling method for Huber loss (constant, exponential, or SNR-based). Only used when loss_type is 'huber' or 'smooth_l1'. default is snr"
+        + " / Huber損失のスケジューリング方法（constant、exponential、またはSNRベース）。loss_typeが'huber'または'smooth_l1'の場合に有効、デフォルトは snr",
+    )
+    parser.add_argument(
+        "--huber_c",
+        type=float,
+        default=0.1,
+        help="The huber loss parameter. Only used if one of the huber loss modes (huber or smooth l1) is selected with loss_type. default is 0.1 / Huber損失のパラメータ。loss_typeがhuberまたはsmooth l1の場合に有効。デフォルトは0.1",
     )
 
     parser.add_argument(
@@ -3278,6 +3493,110 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         )
 
 
+def add_masked_loss_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "--conditioning_data_dir",
+        type=str,
+        default=None,
+        help="conditioning data directory / 条件付けデータのディレクトリ",
+    )
+    parser.add_argument(
+        "--masked_loss",
+        action="store_true",
+        help="apply mask for calculating loss. conditioning_data_dir is required for dataset. / 損失計算時にマスクを適用する。datasetにはconditioning_data_dirが必要",
+    )
+
+
+def get_sanitized_config_or_none(args: argparse.Namespace):
+    # if `--log_config` is enabled, return args for logging. if not, return None.
+    # when `--log_config is enabled, filter out sensitive values from args
+    # if wandb is not enabled, the log is not exposed to the public, but it is fine to filter out sensitive values to be safe
+
+    if not args.log_config:
+        return None
+
+    sensitive_args = ["wandb_api_key", "huggingface_token"]
+    sensitive_path_args = [
+        "pretrained_model_name_or_path",
+        "vae",
+        "tokenizer_cache_dir",
+        "train_data_dir",
+        "conditioning_data_dir",
+        "reg_data_dir",
+        "output_dir",
+        "logging_dir",
+    ]
+    filtered_args = {}
+    for k, v in vars(args).items():
+        # filter out sensitive values and convert to string if necessary
+        if k not in sensitive_args + sensitive_path_args:
+            # Accelerate values need to have type `bool`,`str`, `float`, `int`, or `None`.
+            if v is None or isinstance(v, bool) or isinstance(v, str) or isinstance(v, float) or isinstance(v, int):
+                filtered_args[k] = v
+            # accelerate does not support lists
+            elif isinstance(v, list):
+                filtered_args[k] = f"{v}"
+            # accelerate does not support objects
+            elif isinstance(v, object):
+                filtered_args[k] = f"{v}"
+
+    return filtered_args
+
+
+# verify command line args for training
+def verify_command_line_training_args(args: argparse.Namespace):
+    # if wandb is enabled, the command line is exposed to the public
+    # check whether sensitive options are included in the command line arguments
+    # if so, warn or inform the user to move them to the configuration file
+    # wandbが有効な場合、コマンドラインが公開される
+    # 学習用のコマンドライン引数に敏感なオプションが含まれているかどうかを確認し、
+    # 含まれている場合は設定ファイルに移動するようにユーザーに警告または通知する
+
+    wandb_enabled = args.log_with is not None and args.log_with != "tensorboard"  # "all" or "wandb"
+    if not wandb_enabled:
+        return
+
+    sensitive_args = ["wandb_api_key", "huggingface_token"]
+    sensitive_path_args = [
+        "pretrained_model_name_or_path",
+        "vae",
+        "tokenizer_cache_dir",
+        "train_data_dir",
+        "conditioning_data_dir",
+        "reg_data_dir",
+        "output_dir",
+        "logging_dir",
+    ]
+
+    for arg in sensitive_args:
+        if getattr(args, arg, None) is not None:
+            logger.warning(
+                f"wandb is enabled, but option `{arg}` is included in the command line. Because the command line is exposed to the public, it is recommended to move it to the `.toml` file."
+                + f" / wandbが有効で、かつオプション `{arg}` がコマンドラインに含まれています。コマンドラインは公開されるため、`.toml`ファイルに移動することをお勧めします。"
+            )
+
+    # if path is absolute, it may include sensitive information
+    for arg in sensitive_path_args:
+        if getattr(args, arg, None) is not None and os.path.isabs(getattr(args, arg)):
+            logger.info(
+                f"wandb is enabled, but option `{arg}` is included in the command line and it is an absolute path. Because the command line is exposed to the public, it is recommended to move it to the `.toml` file or use relative path."
+                + f" / wandbが有効で、かつオプション `{arg}` がコマンドラインに含まれており、絶対パスです。コマンドラインは公開されるため、`.toml`ファイルに移動するか、相対パスを使用することをお勧めします。"
+            )
+
+    if getattr(args, "config_file", None) is not None:
+        logger.info(
+            f"wandb is enabled, but option `config_file` is included in the command line. Because the command line is exposed to the public, please be careful about the information included in the path."
+            + f" / wandbが有効で、かつオプション `config_file` がコマンドラインに含まれています。コマンドラインは公開されるため、パスに含まれる情報にご注意ください。"
+        )
+
+    # other sensitive options
+    if args.huggingface_repo_id is not None and args.huggingface_repo_visibility != "public":
+        logger.info(
+            f"wandb is enabled, but option huggingface_repo_id is included in the command line and huggingface_repo_visibility is not 'public'. Because the command line is exposed to the public, it is recommended to move it to the `.toml` file."
+            + f" / wandbが有効で、かつオプション huggingface_repo_id がコマンドラインに含まれており、huggingface_repo_visibility が 'public' ではありません。コマンドラインは公開されるため、`.toml`ファイルに移動することをお勧めします。"
+        )
+
+
 def verify_training_args(args: argparse.Namespace):
     r"""
     Verify training arguments. Also reflect highvram option to global variable
@@ -3333,6 +3652,18 @@ def verify_training_args(args: argparse.Namespace):
             + " / zero_terminal_snrが有効ですが、v_parameterizationが有効ではありません。学習結果は想定外になる可能性があります"
         )
 
+    if args.sample_every_n_epochs is not None and args.sample_every_n_epochs <= 0:
+        logger.warning(
+            "sample_every_n_epochs is less than or equal to 0, so it will be disabled / sample_every_n_epochsに0以下の値が指定されたため無効になります"
+        )
+        args.sample_every_n_epochs = None
+
+    if args.sample_every_n_steps is not None and args.sample_every_n_steps <= 0:
+        logger.warning(
+            "sample_every_n_steps is less than or equal to 0, so it will be disabled / sample_every_n_stepsに0以下の値が指定されたため無効になります"
+        )
+        args.sample_every_n_steps = None
+
 
 def add_dataset_arguments(
     parser: argparse.ArgumentParser, support_dreambooth: bool, support_caption: bool, support_caption_dropout: bool
@@ -3346,6 +3677,12 @@ def add_dataset_arguments(
     )
     parser.add_argument(
         "--train_data_dir", type=str, default=None, help="directory for train images / 学習画像データのディレクトリ"
+    )
+    parser.add_argument(
+        "--cache_info",
+        action="store_true",
+        help="cache meta information (caption and image size) for faster dataset loading. only available for DreamBooth"
+        + " / メタ情報（キャプションとサイズ）をキャッシュしてデータセット読み込みを高速化する。DreamBooth方式のみ有効",
     )
     parser.add_argument(
         "--shuffle_caption", action="store_true", help="shuffle separated caption / 区切られたcaptionの各要素をshuffleする"
@@ -3469,6 +3806,11 @@ def add_dataset_arguments(
         default=0,
         help="tag length reaches maximum on N steps (or N*max_train_steps if N<1) / N（N<1ならN*max_train_steps）ステップでタグ長が最大になる。デフォルトは0（最初から最大）",
     )
+    parser.add_argument(
+        "--alpha_mask",
+        action="store_true",
+        help="use alpha channel as mask for training / 画像のアルファチャンネルをlossのマスクに使用する",
+    )
 
     parser.add_argument(
         "--dataset_class",
@@ -3575,7 +3917,7 @@ def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentPar
         exit(1)
 
     logger.info(f"Loading settings from {config_path}...")
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding="utf-8") as f:
         config_dict = toml.load(f)
 
     # combine all sections into one
@@ -3678,6 +4020,14 @@ def get_optimizer(args, trainable_params):
     if optimizer_type is None or optimizer_type == "":
         optimizer_type = "AdamW"
     optimizer_type = optimizer_type.lower()
+
+    if args.fused_backward_pass:
+        assert (
+            optimizer_type == "Adafactor".lower()
+        ), "fused_backward_pass currently only works with optimizer_type Adafactor / fused_backward_passは現在optimizer_type Adafactorでのみ機能します"
+        assert (
+            args.gradient_accumulation_steps == 1
+        ), "fused_backward_pass does not work with gradient_accumulation_steps > 1 / fused_backward_passはgradient_accumulation_steps>1では機能しません"
 
     # 引数を分解する
     optimizer_kwargs = {}
@@ -4084,6 +4434,10 @@ def load_tokenizer(args: argparse.Namespace):
 
 
 def prepare_accelerator(args: argparse.Namespace):
+    """
+    this function also prepares deepspeed plugin
+    """
+
     if args.logging_dir is None:
         logging_dir = None
     else:
@@ -4129,6 +4483,8 @@ def prepare_accelerator(args: argparse.Namespace):
         ),
     )
     kwargs_handlers = list(filter(lambda x: x is not None, kwargs_handlers))
+    deepspeed_plugin = deepspeed_utils.prepare_deepspeed_plugin(args)
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -4136,6 +4492,7 @@ def prepare_accelerator(args: argparse.Namespace):
         project_dir=logging_dir,
         kwargs_handlers=kwargs_handlers,
         dynamo_backend=dynamo_backend,
+        deepspeed_plugin=deepspeed_plugin,
     )
     print("accelerator device:", accelerator.device)
     return accelerator
@@ -4206,7 +4563,6 @@ def _load_target_model(args: argparse.Namespace, weight_dtype, device="cpu", une
 
 
 def load_target_model(args, weight_dtype, accelerator, unet_use_linear_projection_in_v2=False):
-    # load models for each process
     for pi in range(accelerator.state.num_processes):
         if pi == accelerator.state.local_process_index:
             logger.info(f"loading model for process {accelerator.state.local_process_index}/{accelerator.state.num_processes}")
@@ -4217,7 +4573,6 @@ def load_target_model(args, weight_dtype, accelerator, unet_use_linear_projectio
                 accelerator.device if args.lowram else "cpu",
                 unet_use_linear_projection_in_v2=unet_use_linear_projection_in_v2,
             )
-
             # work on low-ram device
             if args.lowram:
                 text_encoder.to(accelerator.device)
@@ -4226,7 +4581,6 @@ def load_target_model(args, weight_dtype, accelerator, unet_use_linear_projectio
 
             clean_memory_on_device(accelerator.device)
         accelerator.wait_for_everyone()
-
     return text_encoder, vae, unet, load_stable_diffusion_format
 
 
@@ -4693,11 +5047,47 @@ def save_sd_model_on_train_end_common(
             huggingface_util.upload(args, out_dir, "/" + model_name, force_sync_upload=True)
 
 
+def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, device):
+
+    # TODO: if a huber loss is selected, it will use constant timesteps for each batch
+    # as. In the future there may be a smarter way
+
+    if args.loss_type == "huber" or args.loss_type == "smooth_l1":
+        timesteps = torch.randint(min_timestep, max_timestep, (1,), device="cpu")
+        timestep = timesteps.item()
+
+        if args.huber_schedule == "exponential":
+            alpha = -math.log(args.huber_c) / noise_scheduler.config.num_train_timesteps
+            huber_c = math.exp(-alpha * timestep)
+        elif args.huber_schedule == "snr":
+            alphas_cumprod = noise_scheduler.alphas_cumprod[timestep]
+            sigmas = ((1.0 - alphas_cumprod) / alphas_cumprod) ** 0.5
+            huber_c = (1 - args.huber_c) / (1 + sigmas) ** 2 + args.huber_c
+        elif args.huber_schedule == "constant":
+            huber_c = args.huber_c
+        else:
+            raise NotImplementedError(f"Unknown Huber loss schedule {args.huber_schedule}!")
+
+        timesteps = timesteps.repeat(b_size).to(device)
+    elif args.loss_type == "l2":
+        timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device=device)
+        huber_c = 1  # may be anything, as it's not used
+    else:
+        raise NotImplementedError(f"Unknown loss type {args.loss_type}")
+    timesteps = timesteps.long()
+
+    return timesteps, huber_c
+
+
 def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
     # Sample noise that we'll add to the latents
     noise = torch.randn_like(latents, device=latents.device)
     if args.noise_offset:
-        noise = custom_train_functions.apply_noise_offset(latents, noise, args.noise_offset, args.adaptive_noise_scale)
+        if args.noise_offset_random_strength:
+            noise_offset = torch.rand(1, device=latents.device) * args.noise_offset
+        else:
+            noise_offset = args.noise_offset
+        noise = custom_train_functions.apply_noise_offset(latents, noise, noise_offset, args.adaptive_noise_scale)
     if args.multires_noise_iterations:
         noise = custom_train_functions.pyramid_noise_like(
             noise, latents.device, args.multires_noise_iterations, args.multires_noise_discount
@@ -4708,17 +5098,44 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
     min_timestep = 0 if args.min_timestep is None else args.min_timestep
     max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
 
-    timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device=latents.device)
-    timesteps = timesteps.long()
+    timesteps, huber_c = get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, latents.device)
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
     if args.ip_noise_gamma:
-        noisy_latents = noise_scheduler.add_noise(latents, noise + args.ip_noise_gamma * torch.randn_like(latents), timesteps)
+        if args.ip_noise_gamma_random_strength:
+            strength = torch.rand(1, device=latents.device) * args.ip_noise_gamma
+        else:
+            strength = args.ip_noise_gamma
+        noisy_latents = noise_scheduler.add_noise(latents, noise + strength * torch.randn_like(latents), timesteps)
     else:
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-    return noise, noisy_latents, timesteps
+    return noise, noisy_latents, timesteps, huber_c
+
+
+# NOTE: if you're using the scheduled version, huber_c has to depend on the timesteps already
+def conditional_loss(
+    model_pred: torch.Tensor, target: torch.Tensor, reduction: str = "mean", loss_type: str = "l2", huber_c: float = 0.1
+):
+
+    if loss_type == "l2":
+        loss = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
+    elif loss_type == "huber":
+        loss = 2 * huber_c * (torch.sqrt((model_pred - target) ** 2 + huber_c**2) - huber_c)
+        if reduction == "mean":
+            loss = torch.mean(loss)
+        elif reduction == "sum":
+            loss = torch.sum(loss)
+    elif loss_type == "smooth_l1":
+        loss = 2 * (torch.sqrt((model_pred - target) ** 2 + huber_c**2) - huber_c)
+        if reduction == "mean":
+            loss = torch.mean(loss)
+        elif reduction == "sum":
+            loss = torch.sum(loss)
+    else:
+        raise NotImplementedError(f"Unsupported Loss Type {loss_type}")
+    return loss
 
 
 def append_lr_to_logs(logs, lr_scheduler, optimizer_type, including_unet=True):
@@ -5156,6 +5573,8 @@ class LossRecorder:
         if epoch == 0:
             self.loss_list.append(loss)
         else:
+            while len(self.loss_list) <= step:
+                self.loss_list.append(0.0)
             self.loss_total -= self.loss_list[step]
             self.loss_list[step] = loss
         self.loss_total += loss

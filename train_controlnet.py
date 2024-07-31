@@ -5,13 +5,16 @@ import os
 import random
 import time
 from multiprocessing import Value
-from types import SimpleNamespace
+
+# from omegaconf import OmegaConf
 import toml
 
 from tqdm import tqdm
 
 import torch
+from library import deepspeed_utils
 from library.device_utils import init_ipex, clean_memory_on_device
+
 init_ipex()
 
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -147,8 +150,10 @@ def train(args):
             "in_channels": 4,
             "layers_per_block": 2,
             "mid_block_scale_factor": 1,
+            "mid_block_type": "UNetMidBlock2DCrossAttn",
             "norm_eps": 1e-05,
             "norm_num_groups": 32,
+            "num_attention_heads": [5, 10, 20, 20],
             "num_class_embeds": None,
             "only_cross_attention": False,
             "out_channels": 4,
@@ -178,8 +183,10 @@ def train(args):
             "in_channels": 4,
             "layers_per_block": 2,
             "mid_block_scale_factor": 1,
+            "mid_block_type": "UNetMidBlock2DCrossAttn",
             "norm_eps": 1e-05,
             "norm_num_groups": 32,
+            "num_attention_heads": 8,
             "out_channels": 4,
             "sample_size": 64,
             "up_block_types": ["UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"],
@@ -192,7 +199,23 @@ def train(args):
             "resnet_time_scale_shift": "default",
             "projection_class_embeddings_input_dim": None,
         }
-    unet.config = SimpleNamespace(**unet.config)
+    # unet.config = OmegaConf.create(unet.config)
+
+    # make unet.config iterable and accessible by attribute
+    class CustomConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+        def __getattr__(self, name):
+            if name in self.__dict__:
+                return self.__dict__[name]
+            else:
+                raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+
+        def __contains__(self, name):
+            return name in self.__dict__
+
+    unet.config = CustomConfig(**unet.config)
 
     controlnet = ControlNetModel.from_unet(unet)
 
@@ -225,7 +248,7 @@ def train(args):
             )
         vae.to("cpu")
         clean_memory_on_device(accelerator.device)
-        
+
         accelerator.wait_for_everyone()
 
     if args.gradient_checkpointing:
@@ -234,7 +257,7 @@ def train(args):
     # 学習に必要なクラスを準備する
     accelerator.print("prepare optimizer, data loader etc.")
 
-    trainable_params = controlnet.parameters()
+    trainable_params = list(controlnet.parameters())
 
     _, _, optimizer = train_util.get_optimizer(args, trainable_params)
 
@@ -343,7 +366,9 @@ def train(args):
         if args.log_tracker_config is not None:
             init_kwargs = toml.load(args.log_tracker_config)
         accelerator.init_trackers(
-            "controlnet_train" if args.log_tracker_name is None else args.log_tracker_name, init_kwargs=init_kwargs
+            "controlnet_train" if args.log_tracker_name is None else args.log_tracker_name,
+            config=train_util.get_sanitized_config_or_none(args),
+            init_kwargs=init_kwargs,
         )
 
     loss_recorder = train_util.LossRecorder()
@@ -396,7 +421,7 @@ def train(args):
             with accelerator.accumulate(controlnet):
                 with torch.no_grad():
                     if "latents" in batch and batch["latents"] is not None:
-                        latents = batch["latents"].to(accelerator.device)
+                        latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
                     else:
                         # latentに変換
                         latents = vae.encode(batch["images"].to(dtype=weight_dtype)).latent_dist.sample()
@@ -419,13 +444,10 @@ def train(args):
                     )
 
                 # Sample a random timestep for each image
-                timesteps = torch.randint(
-                    0,
-                    noise_scheduler.config.num_train_timesteps,
-                    (b_size,),
-                    device=latents.device,
+                timesteps, huber_c = train_util.get_timesteps_and_huber_c(
+                    args, 0, noise_scheduler.config.num_train_timesteps, noise_scheduler, b_size, latents.device
                 )
-                timesteps = timesteps.long()
+
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
@@ -456,7 +478,9 @@ def train(args):
                 else:
                     target = noise
 
-                loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none")
+                loss = train_util.conditional_loss(
+                    noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
+                )
                 loss = loss.mean([1, 2, 3])
 
                 loss_weights = batch["loss_weights"]  # 各sampleごとのweight
@@ -565,7 +589,7 @@ def train(args):
 
     accelerator.end_training()
 
-    if is_main_process and args.save_state:
+    if is_main_process and (args.save_state or args.save_state_on_train_end):
         train_util.save_state_on_train_end(args, accelerator)
 
     # del accelerator  # この後メモリを使うのでこれは消す→printで使うので消さずにおく
@@ -584,6 +608,7 @@ def setup_parser() -> argparse.ArgumentParser:
     train_util.add_sd_models_arguments(parser)
     train_util.add_dataset_arguments(parser, False, True, True)
     train_util.add_training_arguments(parser, False)
+    deepspeed_utils.add_deepspeed_arguments(parser)
     train_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
     custom_train_functions.add_custom_train_arguments(parser)
@@ -615,6 +640,7 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
+    train_util.verify_command_line_training_args(args)
     args = train_util.read_config_from_file(args, parser)
 
     train(args)

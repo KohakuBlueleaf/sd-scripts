@@ -14,13 +14,12 @@ from tqdm import tqdm
 
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
-init_ipex()
 
-from torch.nn.parallel import DistributedDataParallel as DDP
+init_ipex()
 
 from accelerate.utils import set_seed
 from diffusers import DDPMScheduler
-from library import model_util
+from library import deepspeed_utils, model_util
 
 import library.train_util as train_util
 from library.train_util import (
@@ -40,6 +39,7 @@ from library.custom_train_functions import (
     scale_v_prediction_loss_like_noise_prediction,
     add_v_prediction_like_loss,
     apply_debiased_estimation,
+    apply_masked_loss,
 )
 from library.utils import setup_logging, add_logging_arguments
 
@@ -56,7 +56,15 @@ class NetworkTrainer:
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
-        self, args: argparse.Namespace, current_loss, avr_loss, lr_scheduler, keys_scaled=None, mean_norm=None, maximum_norm=None
+        self,
+        args: argparse.Namespace,
+        current_loss,
+        avr_loss,
+        lr_scheduler,
+        lr_descriptions,
+        keys_scaled=None,
+        mean_norm=None,
+        maximum_norm=None,
     ):
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
 
@@ -66,34 +74,26 @@ class NetworkTrainer:
             logs["max_norm/max_key_norm"] = maximum_norm
 
         lrs = lr_scheduler.get_last_lr()
-
-        if args.network_train_text_encoder_only or len(lrs) <= 2:  # not block lr (or single block)
-            if args.network_train_unet_only:
-                logs["lr/unet"] = float(lrs[0])
-            elif args.network_train_text_encoder_only:
-                logs["lr/textencoder"] = float(lrs[0])
+        for i, lr in enumerate(lrs):
+            if lr_descriptions is not None:
+                lr_desc = lr_descriptions[i]
             else:
-                logs["lr/textencoder"] = float(lrs[0])
-                logs["lr/unet"] = float(lrs[-1])  # may be same to textencoder
+                idx = i - (0 if args.network_train_unet_only else -1)
+                if idx == -1:
+                    lr_desc = "textencoder"
+                else:
+                    if len(lrs) > 2:
+                        lr_desc = f"group{idx}"
+                    else:
+                        lr_desc = "unet"
 
-            if (
-                args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower()
-            ):  # tracking d*lr value of unet.
-                logs["lr/d*lr"] = (
-                    lr_scheduler.optimizers[-1].param_groups[0]["d"] * lr_scheduler.optimizers[-1].param_groups[0]["lr"]
+            logs[f"lr/{lr_desc}"] = lr
+
+            if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
+                # tracking d*lr value
+                logs[f"lr/d*lr/{lr_desc}"] = (
+                    lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
                 )
-        else:
-            idx = 0
-            if not args.network_train_unet_only:
-                logs["lr/textencoder"] = float(lrs[0])
-                idx = 1
-
-            for i in range(idx, len(lrs)):
-                logs[f"lr/group{i}"] = float(lrs[i])
-                if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
-                    logs[f"lr/d*lr/group{i}"] = (
-                        lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
-                    )
 
         return logs
 
@@ -142,6 +142,7 @@ class NetworkTrainer:
         training_started_at = time.time()
         train_util.verify_training_args(args)
         train_util.prepare_dataset_args(args, True)
+        deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)
 
         cache_latents = args.cache_latents
@@ -158,7 +159,7 @@ class NetworkTrainer:
 
         # データセットを準備する
         if args.dataset_class is None:
-            blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, True, False, True))
+            blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, True, args.masked_loss, True))
             if use_user_config:
                 logger.info(f"Loading dataset config from {args.dataset_config}")
                 user_config = config_util.load_user_config(args.dataset_config)
@@ -325,6 +326,7 @@ class NetworkTrainer:
         network.apply_to(text_encoder, unet, train_text_encoder, train_unet)
 
         if args.network_weights is not None:
+            # FIXME consider alpha of weights
             info = network.load_weights(args.network_weights)
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
 
@@ -340,12 +342,30 @@ class NetworkTrainer:
 
         # 後方互換性を確保するよ
         try:
-            trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr, args.learning_rate)
-        except TypeError:
-            accelerator.print(
-                "Deprecated: use prepare_optimizer_params(text_encoder_lr, unet_lr, learning_rate) instead of prepare_optimizer_params(text_encoder_lr, unet_lr)"
-            )
+            results = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr, args.learning_rate)
+            if type(results) is tuple:
+                trainable_params = results[0]
+                lr_descriptions = results[1]
+            else:
+                trainable_params = results
+                lr_descriptions = None
+        except TypeError as e:
+            # logger.warning(f"{e}")
+            # accelerator.print(
+            #     "Deprecated: use prepare_optimizer_params(text_encoder_lr, unet_lr, learning_rate) instead of prepare_optimizer_params(text_encoder_lr, unet_lr)"
+            # )
             trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr)
+            lr_descriptions = None
+
+        # if len(trainable_params) == 0:
+        #     accelerator.print("no trainable parameters found / 学習可能なパラメータが見つかりませんでした")
+        # for params in trainable_params:
+        #     for k, v in params.items():
+        #         if type(v) == float:
+        #             pass
+        #         else:
+        #             v = len(v)
+        #         accelerator.print(f"trainable_params: {k} = {v}")
 
         optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
 
@@ -414,20 +434,36 @@ class NetworkTrainer:
                 t_enc.text_model.embeddings.to(dtype=(weight_dtype if te_weight_dtype != weight_dtype else te_weight_dtype))
 
         # acceleratorがなんかよろしくやってくれるらしい / accelerator will do something good
-        if train_unet:
-            unet = accelerator.prepare(unet)
+        if args.deepspeed:
+            ds_model = deepspeed_utils.prepare_deepspeed_model(
+                args,
+                unet=unet if train_unet else None,
+                text_encoder1=text_encoders[0] if train_text_encoder else None,
+                text_encoder2=text_encoders[1] if train_text_encoder and len(text_encoders) > 1 else None,
+                network=network,
+            )
+            ds_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                ds_model, optimizer, train_dataloader, lr_scheduler
+            )
+            training_model = ds_model
         else:
-            unet.to(accelerator.device, dtype=unet_weight_dtype)  # move to device because unet is not prepared by accelerator
-        if train_text_encoder:
-            if len(text_encoders) > 1:
-                text_encoder = text_encoders = [accelerator.prepare(t_enc) for t_enc in text_encoders]
+            if train_unet:
+                unet = accelerator.prepare(unet)
             else:
-                text_encoder = accelerator.prepare(text_encoder)
-                text_encoders = [text_encoder]
-        else:
-            pass  # if text_encoder is not trained, no need to prepare. and device and dtype are already set
+                unet.to(accelerator.device, dtype=unet_weight_dtype)  # move to device because unet is not prepared by accelerator
+            if train_text_encoder:
+                if len(text_encoders) > 1:
+                    text_encoder = text_encoders = [accelerator.prepare(t_enc) for t_enc in text_encoders]
+                else:
+                    text_encoder = accelerator.prepare(text_encoder)
+                    text_encoders = [text_encoder]
+            else:
+                pass  # if text_encoder is not trained, no need to prepare. and device and dtype are already set
 
-        network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(network, optimizer, train_dataloader, lr_scheduler)
+            network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                network, optimizer, train_dataloader, lr_scheduler
+            )
+            training_model = network
 
         if args.gradient_checkpointing:
             # according to TI example in Diffusers, train is required
@@ -456,6 +492,51 @@ class NetworkTrainer:
         # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
         if args.full_fp16:
             train_util.patch_accelerator_for_fp16_training(accelerator)
+
+        # before resuming make hook for saving/loading to save/load the network weights only
+        def save_model_hook(models, weights, output_dir):
+            # pop weights of other models than network to save only network weights
+            # only main process or deepspeed https://github.com/huggingface/diffusers/issues/2606
+            if accelerator.is_main_process or args.deepspeed:
+                remove_indices = []
+                for i, model in enumerate(models):
+                    if not isinstance(model, type(accelerator.unwrap_model(network))):
+                        remove_indices.append(i)
+                for i in reversed(remove_indices):
+                    if len(weights) > i:
+                        weights.pop(i)
+                # print(f"save model hook: {len(weights)} weights will be saved")
+
+            # save current ecpoch and step
+            train_state_file = os.path.join(output_dir, "train_state.json")
+            # +1 is needed because the state is saved before current_step is set from global_step
+            logger.info(f"save train state to {train_state_file} at epoch {current_epoch.value} step {current_step.value+1}")
+            with open(train_state_file, "w", encoding="utf-8") as f:
+                json.dump({"current_epoch": current_epoch.value, "current_step": current_step.value + 1}, f)
+
+        steps_from_state = None
+
+        def load_model_hook(models, input_dir):
+            # remove models except network
+            remove_indices = []
+            for i, model in enumerate(models):
+                if not isinstance(model, type(accelerator.unwrap_model(network))):
+                    remove_indices.append(i)
+            for i in reversed(remove_indices):
+                models.pop(i)
+            # print(f"load model hook: {len(models)} models will be loaded")
+
+            # load current epoch and step to
+            nonlocal steps_from_state
+            train_state_file = os.path.join(input_dir, "train_state.json")
+            if os.path.exists(train_state_file):
+                with open(train_state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                steps_from_state = data["current_step"]
+                logger.info(f"load train state from {train_state_file}: {data}")
+
+        accelerator.register_save_state_pre_hook(save_model_hook)
+        accelerator.register_load_state_pre_hook(load_model_hook)
 
         # resumeする
         train_util.resume_from_local_or_hf_if_specified(accelerator, args)
@@ -530,6 +611,11 @@ class NetworkTrainer:
             "ss_scale_weight_norms": args.scale_weight_norms,
             "ss_ip_noise_gamma": args.ip_noise_gamma,
             "ss_debiased_estimation": bool(args.debiased_estimation_loss),
+            "ss_noise_offset_random_strength": args.noise_offset_random_strength,
+            "ss_ip_noise_gamma_random_strength": args.ip_noise_gamma_random_strength,
+            "ss_loss_type": args.loss_type,
+            "ss_huber_schedule": args.huber_schedule,
+            "ss_huber_c": args.huber_c,
         }
 
         if use_user_config:
@@ -692,7 +778,54 @@ class NetworkTrainer:
             if key in metadata:
                 minimum_metadata[key] = metadata[key]
 
-        progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
+        # calculate steps to skip when resuming or starting from a specific step
+        initial_step = 0
+        if args.initial_epoch is not None or args.initial_step is not None:
+            # if initial_epoch or initial_step is specified, steps_from_state is ignored even when resuming
+            if steps_from_state is not None:
+                logger.warning(
+                    "steps from the state is ignored because initial_step is specified / initial_stepが指定されているため、stateからのステップ数は無視されます"
+                )
+            if args.initial_step is not None:
+                initial_step = args.initial_step
+            else:
+                # num steps per epoch is calculated by num_processes and gradient_accumulation_steps
+                initial_step = (args.initial_epoch - 1) * math.ceil(
+                    len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
+                )
+        else:
+            # if initial_epoch and initial_step are not specified, steps_from_state is used when resuming
+            if steps_from_state is not None:
+                initial_step = steps_from_state
+                steps_from_state = None
+
+        if initial_step > 0:
+            assert (
+                args.max_train_steps > initial_step
+            ), f"max_train_steps should be greater than initial step / max_train_stepsは初期ステップより大きい必要があります: {args.max_train_steps} vs {initial_step}"
+
+        progress_bar = tqdm(
+            range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
+        )
+
+        epoch_to_start = 0
+        if initial_step > 0:
+            if args.skip_until_initial_step:
+                # if skip_until_initial_step is specified, load data and discard it to ensure the same data is used
+                if not args.resume:
+                    logger.info(
+                        f"initial_step is specified but not resuming. lr scheduler will be started from the beginning / initial_stepが指定されていますがresumeしていないため、lr schedulerは最初から始まります"
+                    )
+                logger.info(f"skipping {initial_step} steps / {initial_step}ステップをスキップします")
+                initial_step *= args.gradient_accumulation_steps
+
+                # set epoch to start to make initial_step less than len(train_dataloader)
+                epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+            else:
+                # if not, only epoch no is skipped for informative purpose
+                epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+                initial_step = 0  # do not skip
+
         global_step = 0
 
         noise_scheduler = DDPMScheduler(
@@ -709,7 +842,9 @@ class NetworkTrainer:
             if args.log_tracker_config is not None:
                 init_kwargs = toml.load(args.log_tracker_config)
             accelerator.init_trackers(
-                "network_train" if args.log_tracker_name is None else args.log_tracker_name, init_kwargs=init_kwargs
+                "network_train" if args.log_tracker_name is None else args.log_tracker_name,
+                config=train_util.get_sanitized_config_or_none(args),
+                init_kwargs=init_kwargs,
             )
 
         loss_recorder = train_util.LossRecorder()
@@ -749,7 +884,13 @@ class NetworkTrainer:
         self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
         # training loop
-        for epoch in range(num_train_epochs):
+        if initial_step > 0:  # only if skip_until_initial_step is specified
+            for skip_epoch in range(epoch_to_start):  # skip epochs
+                logger.info(f"skipping epoch {skip_epoch+1} because initial_step (multiplied) is {initial_step}")
+                initial_step -= len(train_dataloader)
+            global_step = initial_step
+
+        for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
 
@@ -757,23 +898,32 @@ class NetworkTrainer:
 
             accelerator.unwrap_model(network).on_epoch_start(text_encoder, unet)
 
-            for step, batch in enumerate(train_dataloader):
+            skipped_dataloader = None
+            if initial_step > 0:
+                skipped_dataloader = accelerator.skip_first_batches(train_dataloader, initial_step - 1)
+                initial_step = 1
+
+            for step, batch in enumerate(skipped_dataloader or train_dataloader):
                 current_step.value = global_step
-                with accelerator.accumulate(network):
+                if initial_step > 0:
+                    initial_step -= 1
+                    continue
+
+                with accelerator.accumulate(training_model):
                     on_step_start(text_encoder, unet)
 
-                    with torch.no_grad():
-                        if "latents" in batch and batch["latents"] is not None:
-                            latents = batch["latents"].to(accelerator.device)
-                        else:
+                    if "latents" in batch and batch["latents"] is not None:
+                        latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
+                    else:
+                        with torch.no_grad():
                             # latentに変換
-                            latents = vae.encode(batch["images"].to(dtype=vae_dtype)).latent_dist.sample()
+                            latents = vae.encode(batch["images"].to(dtype=vae_dtype)).latent_dist.sample().to(dtype=weight_dtype)
 
                             # NaNが含まれていれば警告を表示し0に置き換える
                             if torch.any(torch.isnan(latents)):
                                 accelerator.print("NaN found in latents, replacing with zeros")
                                 latents = torch.nan_to_num(latents, 0, out=latents)
-                        latents = latents * self.vae_scale_factor
+                    latents = latents * self.vae_scale_factor
 
                     # get multiplier for each sample
                     if network_has_multiplier:
@@ -804,7 +954,7 @@ class NetworkTrainer:
 
                     # Sample noise, sample a random timestep for each image, and add noise to the latents,
                     # with noise offset and/or multires noise if specified
-                    noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
+                    noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
                         args, noise_scheduler, latents
                     )
 
@@ -834,7 +984,11 @@ class NetworkTrainer:
                     else:
                         target = noise
 
-                    loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none")
+                    loss = train_util.conditional_loss(
+                        noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
+                    )
+                    if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                        loss = apply_masked_loss(loss, batch)
                     loss = loss.mean([1, 2, 3])
 
                     loss_weights = batch["loss_weights"]  # 各sampleごとのweight
@@ -902,7 +1056,9 @@ class NetworkTrainer:
                     progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
                 if args.logging_dir is not None:
-                    logs = self.generate_step_logs(args, current_loss, avr_loss, lr_scheduler, keys_scaled, mean_norm, maximum_norm)
+                    logs = self.generate_step_logs(
+                        args, current_loss, avr_loss, lr_scheduler, lr_descriptions, keys_scaled, mean_norm, maximum_norm
+                    )
                     accelerator.log(logs, step=global_step)
 
                 if global_step >= args.max_train_steps:
@@ -941,7 +1097,7 @@ class NetworkTrainer:
 
         accelerator.end_training()
 
-        if is_main_process and args.save_state:
+        if is_main_process and (args.save_state or args.save_state_on_train_end):
             train_util.save_state_on_train_end(args, accelerator)
 
         if is_main_process:
@@ -958,6 +1114,8 @@ def setup_parser() -> argparse.ArgumentParser:
     train_util.add_sd_models_arguments(parser)
     train_util.add_dataset_arguments(parser, True, True, True)
     train_util.add_training_arguments(parser, True)
+    train_util.add_masked_loss_arguments(parser)
+    deepspeed_utils.add_deepspeed_arguments(parser)
     train_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
     custom_train_functions.add_custom_train_arguments(parser)
@@ -1051,6 +1209,28 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not use fp16/bf16 VAE in mixed precision (use float VAE) / mixed precisionでも fp16/bf16 VAEを使わずfloat VAEを使う",
     )
+    parser.add_argument(
+        "--skip_until_initial_step",
+        action="store_true",
+        help="skip training until initial_step is reached / initial_stepに到達するまで学習をスキップする",
+    )
+    parser.add_argument(
+        "--initial_epoch",
+        type=int,
+        default=None,
+        help="initial epoch number, 1 means first epoch (same as not specifying). NOTE: initial_epoch/step doesn't affect to lr scheduler. Which means lr scheduler will start from 0 without `--resume`."
+        + " / 初期エポック数、1で最初のエポック（未指定時と同じ）。注意：initial_epoch/stepはlr schedulerに影響しないため、`--resume`しない場合はlr schedulerは0から始まる",
+    )
+    parser.add_argument(
+        "--initial_step",
+        type=int,
+        default=None,
+        help="initial step number including all epochs, 0 means first step (same as not specifying). overwrites initial_epoch."
+        + " / 初期ステップ数、全エポックを含むステップ数、0で最初のステップ（未指定時と同じ）。initial_epochを上書きする",
+    )
+    # parser.add_argument("--loraplus_lr_ratio", default=None, type=float, help="LoRA+ learning rate ratio")
+    # parser.add_argument("--loraplus_unet_lr_ratio", default=None, type=float, help="LoRA+ UNet learning rate ratio")
+    # parser.add_argument("--loraplus_text_encoder_lr_ratio", default=None, type=float, help="LoRA+ text encoder learning rate ratio")
     return parser
 
 
@@ -1058,6 +1238,7 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
+    train_util.verify_command_line_training_args(args)
     args = train_util.read_config_from_file(args, parser)
 
     trainer = NetworkTrainer()
